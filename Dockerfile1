@@ -1,0 +1,21 @@
+FROM python:3.10-slim
+
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+COPY scripts/requirements.txt .
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+COPY scripts/ /workspace/
+
+RUN pip install python-dotenv
+
+RUN chmod -x /workspace/*.py
+
+CMD ["bash", "-c", "source /workspace/.env 2>/dev/null || true && python train.py"]
