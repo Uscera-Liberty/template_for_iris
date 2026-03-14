@@ -18,10 +18,7 @@ warnings.filterwarnings('ignore')
 
 # MLflow tracking URI - адрес сервера MLflow
 # ВАЖНО: Замени на свой IP из команды: kubectl get svc -n mlflow
-MLFLOW_TRACKING_URI = os.getenv(
-    'MLFLOW_TRACKING_URI', 
-    'http://192.168.10.12:30055/'
-)
+MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI', 'http://mlflow:5000')
 
 # Параметры модели Random Forest
 MODEL_PARAMS = {

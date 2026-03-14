@@ -1,14 +1,18 @@
 version: '3.8'
 
 services:
+
   postgres:
     image: postgres:13
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+      # Снижаем потребление памяти postgres
+      POSTGRES_SHARED_BUFFERS: 128MB
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
@@ -17,6 +21,90 @@ services:
     restart: always
     networks:
       - airflow-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: mlops
+      MINIO_ROOT_PASSWORD: quZK9X8PfXfrlpi
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+    networks:
+      - airflow-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 mlops quZK9X8PfXfrlpi &&
+      mc mb local/mlflow --ignore-existing &&
+      echo 'Bucket mlflow created'
+      "
+    networks:
+      - airflow-net
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: mlops
+      AWS_SECRET_ACCESS_KEY: quZK9X8PfXfrlpi
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://airflow:airflow@postgres/mlflow
+      --default-artifact-root s3://mlflow/
+      --host 0.0.0.0
+      --port 5000
+      --workers 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: always
+    networks:
+      - airflow-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
 
   airflow-init:
     build: .
@@ -40,6 +128,8 @@ services:
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
       AIRFLOW_UID: 50000
+      # Снижаем потребление памяти воркеров
+      AIRFLOW__CELERY__WORKER_CONCURRENCY: 2
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -51,6 +141,10 @@ services:
       - airflow-net
     env_file:
       - .env
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   airflow-webserver:
     build: .
@@ -61,7 +155,15 @@ services:
       AIRFLOW__CORE__FERNET_KEY: ''
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__METRICS__STATSD_ON: 'false'
+      AIRFLOW__WEBSERVER__AUTH_RATE_LIMITED: 'false'
+      AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+      AIRFLOW__CORE__AUTH_MANAGER: 'airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
       AIRFLOW_UID: 50000
+      # Один воркер вместо дефолтных 4 — главная экономия памяти
+      AIRFLOW__WEBSERVER__WORKERS: 1
     ports:
       - "8080:8080"
     volumes:
@@ -77,6 +179,12 @@ services:
       - airflow-net
     env_file:
       - .env
+    deploy:
+      resources:
+        limits:
+          memory: 800M
+        reservations:
+          memory: 512M
 
   airflow-scheduler:
     build: .
@@ -86,6 +194,9 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__FERNET_KEY: ''
       AIRFLOW_UID: 50000
+      # Ограничиваем параллельные таски
+      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 2
+      AIRFLOW__SCHEDULER__MAX_THREADS: 1
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -97,9 +208,123 @@ services:
     restart: always
     networks:
       - airflow-net
+    deploy:
+      resources:
+        limits:
+          memory: 800M
+        reservations:
+          memory: 512M
+
+  iris-model-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.serve
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: mlops
+      AWS_SECRET_ACCESS_KEY: quZK9X8PfXfrlpi
+    restart: always
+    networks:
+      - airflow-net
+    depends_on:
+      - mlflow
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+      # Лимит памяти самого Prometheus — не хранить всё в RAM
+      - '--storage.tsdb.wal-compression'
+      - '--query.max-concurrency=2'
+      - '--web.enable-lifecycle'
+    restart: always
+    networks:
+      - airflow-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Отключаем фичи которые жрут память
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_RENDERING_SERVER_URL: ""
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    restart: always
+    networks:
+      - airflow-net
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  iris-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile.exporter
+    ports:
+      - "9101:9101"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      AIRFLOW_URI: http://airflow-webserver:8080
+      AIRFLOW_USER: airflow
+      AIRFLOW_PASS: airflow
+      MINIO_URI: http://minio:9000
+      MINIO_USER: mlops
+      MINIO_PASS: quZK9X8PfXfrlpi
+      SCRAPE_INTERVAL: '30'
+    depends_on:
+      - mlflow
+      - minio
+    restart: always
+    networks:
+      - airflow-net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
 volumes:
   postgres-db-volume:
+  minio-data:
+  prometheus-data:
+  grafana-data:
 
 networks:
   airflow-net:

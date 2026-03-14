@@ -4,11 +4,6 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 import logging
 
-# ============================================
-# КОНФИГУРАЦИЯ DAG
-# ============================================
-
-# Базовые параметры для всех задач
 DEFAULT_ARGS = {
     'owner': 'mlops-team',
     'depends_on_past': False,
@@ -20,15 +15,15 @@ DEFAULT_ARGS = {
 }
 
 # ВАЖНО: Твой внешний MLflow сервер
-MLFLOW_URI = "http://192.168.10.12:30055"
+MLFLOW_URI = "http://mlflow:5000"
 
 # Образ для обучения (соберём локально)
 TRAINING_IMAGE = "iris-train:local"
 
 # Environment variables для всех задач
 ENV_VARS = {
-    'MLFLOW_TRACKING_URI': 'http://192.168.10.12:30055',
-    'MLFLOW_S3_ENDPOINT_URL':'http://192.168.10.11:30174',
+    'MLFLOW_TRACKING_URI': 'http://mlflow:5000',
+    'MLFLOW_S3_ENDPOINT_URL':'http://minio:9000',
     'AWS_ACCESS_KEY_ID': 'mlops',
     'AWS_SECRET_ACCESS_KEY': 'quZK9X8PfXfrlpi',
     'PYTHONUNBUFFERED': '1'
@@ -67,7 +62,7 @@ train_model_task = DockerOperator(
     
     # Docker настройки
     docker_url='unix://var/run/docker.sock',
-    network_mode='bridge',  # Для доступа к внешнему MLflow
+    network_mode='iris-project_airflow-net',
     mount_tmp_dir=False,
     
     # Таймаут выполнения
@@ -154,7 +149,7 @@ except Exception as e:
     
     environment=ENV_VARS,
     docker_url='unix://var/run/docker.sock',
-    network_mode='bridge',
+    network_mode='iris-project_airflow-net',
     mount_tmp_dir=False,
     
     dag=dag,
@@ -241,9 +236,27 @@ except Exception as e:
     
     environment=ENV_VARS,
     docker_url='unix://var/run/docker.sock',
-    network_mode='bridge',
+    network_mode='iris-project_airflow-net',
     mount_tmp_dir=False,
     
+    dag=dag,
+)
+
+reload_model_task = DockerOperator(
+    task_id='reload_model_server',
+    image='curlimages/curl:latest',
+    api_version='auto',
+    auto_remove=True,
+    command=[
+        'curl', '-X', 'POST',
+        'http://iris-model-server:8000/reload-model',
+        '--retry', '3',
+        '--retry-delay', '2',
+        '-v'
+    ],
+    docker_url='unix://var/run/docker.sock',
+    network_mode='iris-project_airflow-net',
+    mount_tmp_dir=False,
     dag=dag,
 )
 
@@ -272,4 +285,4 @@ success_task = PythonOperator(
 # ОПРЕДЕЛЯЕМ ПОРЯДОК ВЫПОЛНЕНИЯ
 # ============================================
 
-train_model_task >> validate_model_task >> register_model_task >> success_task
+train_model_task >> validate_model_task >> register_model_task >> success_task >> reload_model_task
